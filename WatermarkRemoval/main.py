@@ -189,3 +189,6 @@ for epoch in range(num_epochs):
     save_model_onnx(model, epoch + 1, ".\\results\\model")
 
 print("Training complete!")
+
+# See logs
+# tensorboard --logdir="D:\Github\watermarkRemoval\WatermarkRemoval\runs"
