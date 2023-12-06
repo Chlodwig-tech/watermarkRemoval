@@ -8,6 +8,8 @@ import os
 import torch.onnx
 from ignite.metrics import PSNR, SSIM
 import torchmetrics
+from torch.utils.tensorboard import SummaryWriter
+
 class DenseBlock(nn.Module):
     def __init__(self, channels_init, growth_rate, layers):
         super(DenseBlock, self).__init__()
@@ -139,6 +141,8 @@ ssim_metric = SSIM(data_range=255.0, kernel_size=(11, 11), sigma=(1.5, 1.5), k1=
 # LPIPS: the lower, the better
 lpips_metric = torchmetrics.image.lpip.LearnedPerceptualImagePatchSimilarity(net_type='alex', reduction='mean').to(device)
 
+writer = SummaryWriter()
+
 # Training Loop
 num_epochs = 10
 for epoch in range(num_epochs):
@@ -172,6 +176,10 @@ for epoch in range(num_epochs):
         if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
             print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
                   f'Loss: {loss.item():.4f}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LPIPS: {lpips:.4f}')
+            writer.add_scalar("Loss/train", loss, epoch)
+            writer.add_scalar("PSNR", psnr, epoch)
+            writer.add_scalar("SSIM", ssim, epoch)
+            writer.add_scalar("LPIPS", lpips, epoch)
 
         # Reset PSNR for next batch
         psnr_metric.reset()
