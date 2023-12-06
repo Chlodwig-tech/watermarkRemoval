@@ -125,13 +125,19 @@ train_dataset = WatermarkRemovalDataset(
     transform=transform
 )
 
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+# HYPERPARAMETERS ----------
+num_epochs = 10
+learning_rate = 0.001
+batch_size = 32
+save_step = 1
+# --------------------------
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 # Model, Loss Function, and Optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = WatermarkRemovalCNN().to(device)
 criterion = nn.L1Loss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 # PSNR Metric
 # PSNR: the higher, the better
 data_range = 255.0  # images in 0-255 range
@@ -141,10 +147,23 @@ ssim_metric = SSIM(data_range=255.0, kernel_size=(11, 11), sigma=(1.5, 1.5), k1=
 # LPIPS: the lower, the better
 lpips_metric = torchmetrics.image.lpip.LearnedPerceptualImagePatchSimilarity(net_type='alex', reduction='mean').to(device)
 
+
 writer = SummaryWriter()
+hparams = {
+    'learning_rate': learning_rate,
+    'batch_size': batch_size,
+    'num_epochs': num_epochs,
+    'save_step': save_step
+}
+metrics = {
+    'loss': 0.0,
+    'PSNR': 0.0,
+    'SSIM': 0.0,
+    'LPIPS': 0.0,
+}
+writer.add_hparams(hparam_dict=hparams, metric_dict=metrics)
 
 # Training Loop
-num_epochs = 10
 for epoch in range(num_epochs):
     model.train()
     for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
@@ -186,9 +205,11 @@ for epoch in range(num_epochs):
         lpips_metric.reset()
         ssim_metric.reset()
 
-    save_model_onnx(model, epoch + 1, "./results/model")
+    if epoch % save_step == 0:
+        save_model_onnx(model, epoch + 1, "./results/model")
 
 print("Training complete!")
+writer.close()
 
 # See logs
 # tensorboard --logdir="D:\Github\watermarkRemoval\WatermarkRemoval\runs"
