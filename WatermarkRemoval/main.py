@@ -120,8 +120,8 @@ transform = transforms.Compose([
 
 # Prepare the dataset and dataloaders
 train_dataset = WatermarkRemovalDataset(
-    watermarked_dir="..\\Data\\CLWD\\train\\Watermarked_image",
-    watermark_free_dir="..\\Data\\CLWD\\train\\Watermark_free_image",
+    watermarked_dir="../Data/CLWD/train/Watermarked_image",
+    watermark_free_dir="../Data/CLWD/train/Watermark_free_image",
     transform=transform
 )
 
@@ -186,7 +186,7 @@ for epoch in range(num_epochs):
         lpips_metric.reset()
         ssim_metric.reset()
 
-    save_model_onnx(model, epoch + 1, ".\\results\\model")
+    save_model_onnx(model, epoch + 1, "./results/model")
 
 print("Training complete!")
 
