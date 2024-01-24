@@ -172,7 +172,7 @@ def objective(trial):
     batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
     growth_rate = trial.suggest_int('growth_rate', 4, 16)
     bottleneck_channels = trial.suggest_categorical('bottleneck_channels', [64, 128, 256])
-    num_epochs = 5
+    num_epochs = 2
     channels_init = growth_rate * 2
 
     model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
@@ -221,10 +221,10 @@ def objective(trial):
 
     print("Training complete!")
     # Return the metric you want to optimize (e.g., -loss, psnr, etc.)
-    return lpips_metric
+    return lpips
 
 study = optuna.create_study(direction='maximize')  # or 'minimize' for loss
-study.optimize(objective, n_trials=100)
+study.optimize(objective, n_trials=3)
 
 print("Best trial:")
 trial = study.best_trial
