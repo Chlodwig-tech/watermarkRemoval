@@ -10,6 +10,7 @@ from ignite.metrics import PSNR, SSIM
 import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
 import optuna
+from torch.utils.data import random_split
 
 class DenseBlock(nn.Module):
     def __init__(self, channels_init, growth_rate, layers):
@@ -92,6 +93,11 @@ class WatermarkRemovalDataset(Dataset):
             watermark_free_image = self.transform(watermark_free_image)
         return watermarked_image, watermark_free_image
 
+def calculate_loss(outputs, targets):
+    image_mask = -(outputs - targets)  # Mask after application on the image
+    abs_loss = torch.mean(torch.abs(outputs - image_mask) ** 0.5)
+    return abs_loss
+
 def save_model_onnx(model, epoch, file_path, input_size=(1, 3, 256, 256)):
     # Set the model to evaluation mode
     model.eval()
@@ -137,8 +143,9 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 # Model, Loss Function, and Optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
-criterion = nn.L1Loss()
+#criterion = nn.L1Loss()
 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
 # PSNR Metric
 # PSNR: the higher, the better
 data_range = 255.0  # images in 0-255 range
@@ -147,6 +154,15 @@ psnr_metric = PSNR(data_range=data_range, device=device)
 ssim_metric = SSIM(data_range=255.0, kernel_size=(11, 11), sigma=(1.5, 1.5), k1=0.01, k2=0.03, gaussian=True, device=device)
 # LPIPS: the lower, the better
 lpips_metric = torchmetrics.image.lpip.LearnedPerceptualImagePatchSimilarity(net_type='alex', reduction='mean').to(device)
+
+# Dataset Splitting
+total_size = len(train_dataset)
+train_size = int(0.8 * total_size)
+val_size = total_size - train_size
+train_dataset, val_dataset = random_split(train_dataset, [train_size, val_size])
+
+# DataLoader for Validation Set
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 
 writer = SummaryWriter()
@@ -178,21 +194,38 @@ def objective(trial):
     model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    # Training Loop
+    # Training Loop with Validation and Mask Creation
     for epoch in range(num_epochs):
         model.train()
         for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
             watermarked_images = watermarked_images.to(device)
             watermark_free_images = watermark_free_images.to(device)
 
+            # Move data to GPU if available
+            watermarked_images = watermarked_images.to(device)
+            watermark_free_images = watermark_free_images.to(device)
+
             # Forward pass
             outputs = model(watermarked_images)
-            loss = criterion(outputs, watermark_free_images)
+            #loss = criterion(outputs, watermark_free_images)
+            loss = calculate_loss(outputs, watermark_free_images)
 
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            # Validation phase
+            model.eval()
+            with torch.no_grad():
+                for watermarked_images, watermark_free_images in val_loader:
+                    # Move data to GPU if available
+                    watermarked_images = watermarked_images.to(device)
+                    watermark_free_images = watermark_free_images.to(device)
+
+                    # Forward pass
+                    outputs = model(watermarked_images)
+                    loss = calculate_loss(outputs, watermark_free_images)
 
             # Calculate the metrics
             psnr_metric.update((outputs, watermark_free_images))
@@ -202,6 +235,10 @@ def objective(trial):
             outputs_normalized = torch.clamp(2 * outputs - 1, min=-1, max=1)
             targets_normalized = torch.clamp(2 * watermark_free_images - 1, min=-1, max=1)
             lpips = lpips_metric(outputs_normalized, targets_normalized)
+
+            #         if epoch == 0 and i == 0:
+            #             print(f"Traing started on device: {device}")
+            #         #print(f"i: {i}")
 
             if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
                 print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
@@ -233,6 +270,8 @@ print(f"  Value: {trial.value}")
 print("  Params: ")
 for key, value in trial.params.items():
     print(f"    {key}: {value}")
+
+
 
 # # Training Loop
 # for epoch in range(num_epochs):
