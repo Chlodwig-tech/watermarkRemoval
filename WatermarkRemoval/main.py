@@ -11,6 +11,8 @@ import torchmetrics
 from torch.utils.tensorboard import SummaryWriter
 import optuna
 from torch.utils.data import random_split
+import numpy as np
+import torchvision.transforms as T
 
 class DenseBlock(nn.Module):
     def __init__(self, channels_init, growth_rate, layers):
@@ -75,6 +77,7 @@ class WatermarkRemovalCNN(nn.Module):
         x = self.final_conv(x)
         #print("After final_conv:", x.shape)
         return x
+
 class WatermarkRemovalDataset(Dataset):
     def __init__(self, watermarked_dir, watermark_free_dir, transform=None):
         self.watermarked_dir = watermarked_dir
@@ -93,10 +96,36 @@ class WatermarkRemovalDataset(Dataset):
             watermark_free_image = self.transform(watermark_free_image)
         return watermarked_image, watermark_free_image
 
-def calculate_loss(outputs, targets):
-    image_mask = -(outputs - targets)  # Mask after application on the image
-    abs_loss = torch.mean(torch.abs(outputs - image_mask) ** 0.5)
+def calculate_loss(predictions, targets, masks):
+    # Apply the mask to the targets
+    image_mask = -(targets - masks)
+    abs_loss = torch.mean(torch.abs(predictions - image_mask) ** 0.5)
     return abs_loss
+
+def create_mask(height, width, min_opacity, max_opacity):
+    # Random parameters for the mask
+    mask_h = np.random.randint(int(height * .7), int(height * .9))
+    mask_w = np.random.randint(int(width * .1), int(width * .3))
+    opacity = np.random.uniform(min_opacity, max_opacity)
+    max_angle = np.random.uniform(-1.5, 1.5)
+
+    # Create mask
+    mask = np.ones((mask_h, mask_w)) * opacity
+    mask *= np.random.choice([-1, 1])
+    y_pos = np.random.randint(0, height - mask_h)
+    x_pos = np.random.randint(0, width - mask_w)
+
+    # Apply padding
+    mask = np.pad(mask, ((y_pos, height - mask_h - y_pos), (x_pos, width - mask_w - x_pos)))
+
+    # Rotate mask
+    mask = Image.fromarray(mask)
+    mask = T.functional.rotate(mask, max_angle)
+
+    return torch.tensor(np.array(mask), dtype=torch.float32).unsqueeze(0)  # Add channel dimension
+
+def batch_masks(batch_size, height, width, min_opacity, max_opacity):
+    return torch.stack([create_mask(height, width, min_opacity, max_opacity) for _ in range(batch_size)])
 
 def save_model_onnx(model, epoch, file_path, input_size=(1, 3, 256, 256)):
     # Set the model to evaluation mode
@@ -138,6 +167,9 @@ channels_init = growth_rate * 2  # 16
 bottleneck_channels = 128
 # --------------------------
 save_step = 1
+min_opacity = 0.3
+max_opacity = 1.0
+
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
 # Model, Loss Function, and Optimizer
@@ -182,143 +214,170 @@ metrics = {
 }
 writer.add_hparams(hparam_dict=hparams, metric_dict=metrics)
 
-def objective(trial):
-    # Suggest values for the hyperparameters
-    learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
-    batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
-    growth_rate = trial.suggest_int('growth_rate', 4, 16)
-    bottleneck_channels = trial.suggest_categorical('bottleneck_channels', [64, 128, 256])
-    num_epochs = 2
-    channels_init = growth_rate * 2
+model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-    model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# Training Loop
+for epoch in range(num_epochs):
+    model.train()
+    for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
+        # Move data to GPU if available
+        watermarked_images = watermarked_images.to(device)
+        watermark_free_images = watermark_free_images.to(device)
 
-    # Training Loop with Validation and Mask Creation
-    for epoch in range(num_epochs):
-        model.train()
-        for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
-            watermarked_images = watermarked_images.to(device)
-            watermark_free_images = watermark_free_images.to(device)
+        # Generate masks
+        masks = batch_masks(watermarked_images.size(0), watermarked_images.size(2), watermarked_images.size(3), min_opacity, max_opacity).to(device)
 
-            # Move data to GPU if available
-            watermarked_images = watermarked_images.to(device)
-            watermark_free_images = watermark_free_images.to(device)
+        # Apply masks to images
+        watermarked_images_with_mask = watermarked_images - masks
 
-            # Forward pass
-            outputs = model(watermarked_images)
-            #loss = criterion(outputs, watermark_free_images)
-            loss = calculate_loss(outputs, watermark_free_images)
+        # Forward pass
+        outputs = model(watermarked_images_with_mask)
+        loss = calculate_loss(outputs, watermark_free_images, masks)
 
-            # Backward and optimize
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        # Forward pass
+        outputs = model(watermarked_images)
+        #loss = criterion(outputs, watermark_free_images)
+        loss = calculate_loss(outputs, watermark_free_images, masks)
 
-            # Validation phase
-            model.eval()
-            with torch.no_grad():
-                for watermarked_images, watermark_free_images in val_loader:
-                    # Move data to GPU if available
-                    watermarked_images = watermarked_images.to(device)
-                    watermark_free_images = watermark_free_images.to(device)
+        # Backward and optimize
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-                    # Forward pass
-                    outputs = model(watermarked_images)
-                    loss = calculate_loss(outputs, watermark_free_images)
+        # Validation phase
+        model.eval()
+        with torch.no_grad():
+            for watermarked_images, watermark_free_images in val_loader:
+                # Move data to GPU if available
+                watermarked_images = watermarked_images.to(device)
+                watermark_free_images = watermark_free_images.to(device)
 
-            # Calculate the metrics
-            psnr_metric.update((outputs, watermark_free_images))
-            psnr = psnr_metric.compute()
-            ssim_metric.update((outputs, watermark_free_images))
-            ssim = ssim_metric.compute()
-            outputs_normalized = torch.clamp(2 * outputs - 1, min=-1, max=1)
-            targets_normalized = torch.clamp(2 * watermark_free_images - 1, min=-1, max=1)
-            lpips = lpips_metric(outputs_normalized, targets_normalized)
+                # Forward pass
+                outputs = model(watermarked_images)
+                loss = calculate_loss(outputs, watermark_free_images, masks)
 
-            #         if epoch == 0 and i == 0:
-            #             print(f"Traing started on device: {device}")
-            #         #print(f"i: {i}")
+        # Calculate the metrics
+        psnr_metric.update((outputs, watermark_free_images))
+        psnr = psnr_metric.compute()
+        ssim_metric.update((outputs, watermark_free_images))
+        ssim = ssim_metric.compute()
+        outputs_normalized = torch.clamp(2 * outputs - 1, min=-1, max=1)
+        targets_normalized = torch.clamp(2 * watermark_free_images - 1, min=-1, max=1)
+        lpips = lpips_metric(outputs_normalized, targets_normalized)
 
-            if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
-                print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
-                      f'Loss: {loss.item():.4f}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LPIPS: {lpips:.4f}')
-                writer.add_scalar("Loss/train", loss, epoch)
-                writer.add_scalar("PSNR", psnr, epoch)
-                writer.add_scalar("SSIM", ssim, epoch)
-                writer.add_scalar("LPIPS", lpips, epoch)
+        #         if epoch == 0 and i == 0:
+        #             print(f"Traing started on device: {device}")
+        #         #print(f"i: {i}")
 
-            # Reset PSNR for next batch
-            psnr_metric.reset()
-            lpips_metric.reset()
-            ssim_metric.reset()
+        if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
+            print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
+                  f'Loss: {loss.item():.4f}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LPIPS: {lpips:.4f}')
+            writer.add_scalar("Loss/train", loss, epoch)
+            writer.add_scalar("PSNR", psnr, epoch)
+            writer.add_scalar("SSIM", ssim, epoch)
+            writer.add_scalar("LPIPS", lpips, epoch)
 
-        if epoch % save_step == 0:
-            save_model_onnx(model, epoch + 1, "./results/model")
+        # Reset PSNR for next batch
+        psnr_metric.reset()
+        lpips_metric.reset()
+        ssim_metric.reset()
 
-    print("Training complete!")
-    # Return the metric you want to optimize (e.g., -loss, psnr, etc.)
-    return lpips
+    if epoch % save_step == 0:
+        save_model_onnx(model, epoch + 1, "./results/model")
 
-study = optuna.create_study(direction='maximize')  # or 'minimize' for loss
-study.optimize(objective, n_trials=3)
-
-print("Best trial:")
-trial = study.best_trial
-
-print(f"  Value: {trial.value}")
-print("  Params: ")
-for key, value in trial.params.items():
-    print(f"    {key}: {value}")
+print("Training complete!")
 
 
-
-# # Training Loop
-# for epoch in range(num_epochs):
-#     model.train()
-#     for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
-#         watermarked_images = watermarked_images.to(device)
-#         watermark_free_images = watermark_free_images.to(device)
+# def objective(trial):
+#     # Suggest values for the hyperparameters
+#     learning_rate = trial.suggest_float('learning_rate', 1e-5, 1e-2, log=True)
+#     batch_size = trial.suggest_int('batch_size', 16, 128, log=True)
+#     growth_rate = trial.suggest_int('growth_rate', 4, 16)
+#     bottleneck_channels = trial.suggest_categorical('bottleneck_channels', [64, 128, 256])
+#     num_epochs = 2
+#     channels_init = growth_rate * 2
 #
-#         # Forward pass
-#         outputs = model(watermarked_images)
-#         loss = criterion(outputs, watermark_free_images)
+#     model = WatermarkRemovalCNN(growth_rate, channels_init, bottleneck_channels).to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 #
-#         # Backward and optimize
-#         optimizer.zero_grad()
-#         loss.backward()
-#         optimizer.step()
+#     # Training Loop with Validation and Mask Creation
+#     for epoch in range(num_epochs):
+#         model.train()
+#         for i, (watermarked_images, watermark_free_images) in enumerate(train_loader):
+#             watermarked_images = watermarked_images.to(device)
+#             watermark_free_images = watermark_free_images.to(device)
 #
-#         # Calculate the metrics
-#         psnr_metric.update((outputs, watermark_free_images))
-#         psnr = psnr_metric.compute()
-#         ssim_metric.update((outputs, watermark_free_images))
-#         ssim = ssim_metric.compute()
-#         outputs_normalized = torch.clamp(2 * outputs - 1, min=-1, max=1)
-#         targets_normalized = torch.clamp(2 * watermark_free_images - 1, min=-1, max=1)
-#         lpips = lpips_metric(outputs_normalized, targets_normalized)
+#             # Move data to GPU if available
+#             watermarked_images = watermarked_images.to(device)
+#             watermark_free_images = watermark_free_images.to(device)
 #
-#         if epoch == 0 and i == 0:
-#             print(f"Traing started on device: {device}")
-#         #print(f"i: {i}")
+#             # Forward pass
+#             outputs = model(watermarked_images)
+#             #loss = criterion(outputs, watermark_free_images)
+#             loss = calculate_loss(outputs, watermark_free_images)
 #
-#         if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
-#             print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
-#                   f'Loss: {loss.item():.4f}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LPIPS: {lpips:.4f}')
-#             writer.add_scalar("Loss/train", loss, epoch)
-#             writer.add_scalar("PSNR", psnr, epoch)
-#             writer.add_scalar("SSIM", ssim, epoch)
-#             writer.add_scalar("LPIPS", lpips, epoch)
+#             # Backward and optimize
+#             optimizer.zero_grad()
+#             loss.backward()
+#             optimizer.step()
 #
-#         # Reset PSNR for next batch
-#         psnr_metric.reset()
-#         lpips_metric.reset()
-#         ssim_metric.reset()
+#             # Validation phase
+#             model.eval()
+#             with torch.no_grad():
+#                 for watermarked_images, watermark_free_images in val_loader:
+#                     # Move data to GPU if available
+#                     watermarked_images = watermarked_images.to(device)
+#                     watermark_free_images = watermark_free_images.to(device)
 #
-#     if epoch % save_step == 0:
-#         save_model_onnx(model, epoch + 1, "./results/model")
+#                     # Forward pass
+#                     outputs = model(watermarked_images)
+#                     loss = calculate_loss(outputs, watermark_free_images)
 #
-# print("Training complete!")
+#             # Calculate the metrics
+#             psnr_metric.update((outputs, watermark_free_images))
+#             psnr = psnr_metric.compute()
+#             ssim_metric.update((outputs, watermark_free_images))
+#             ssim = ssim_metric.compute()
+#             outputs_normalized = torch.clamp(2 * outputs - 1, min=-1, max=1)
+#             targets_normalized = torch.clamp(2 * watermark_free_images - 1, min=-1, max=1)
+#             lpips = lpips_metric(outputs_normalized, targets_normalized)
+#
+#             #         if epoch == 0 and i == 0:
+#             #             print(f"Traing started on device: {device}")
+#             #         #print(f"i: {i}")
+#
+#             if (i + 1) % 100 == 0 or (epoch == 0 and i == 0):
+#                 print(f'Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}/{len(train_loader)}], '
+#                       f'Loss: {loss.item():.4f}, PSNR: {psnr:.4f}, SSIM: {ssim:.4f}, LPIPS: {lpips:.4f}')
+#                 writer.add_scalar("Loss/train", loss, epoch)
+#                 writer.add_scalar("PSNR", psnr, epoch)
+#                 writer.add_scalar("SSIM", ssim, epoch)
+#                 writer.add_scalar("LPIPS", lpips, epoch)
+#
+#             # Reset PSNR for next batch
+#             psnr_metric.reset()
+#             lpips_metric.reset()
+#             ssim_metric.reset()
+#
+#         if epoch % save_step == 0:
+#             save_model_onnx(model, epoch + 1, "./results/model")
+#
+#     print("Training complete!")
+#     # Return the metric you want to optimize (e.g., -loss, psnr, etc.)
+#     return lpips
+#
+# study = optuna.create_study(direction='maximize')  # or 'minimize' for loss
+# study.optimize(objective, n_trials=3)
+#
+# print("Best trial:")
+# trial = study.best_trial
+#
+# print(f"  Value: {trial.value}")
+# print("  Params: ")
+# for key, value in trial.params.items():
+#     print(f"    {key}: {value}")
+
 
 writer.close()
 
